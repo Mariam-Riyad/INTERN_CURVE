@@ -1,10 +1,89 @@
+import os
+from pathlib import Path
+
 import streamlit as st
 import pandas as pd
+import plotly.express as px
 import joblib
 import requests
 import numpy as np
 
 st.set_page_config(page_title="Real Estate AI", page_icon="🏠")
+@st.cache_data
+def load_market_data():
+    path = Path(__file__).resolve().parent / "data" / "real_estate_cleaned.csv"
+    columns = ["city", "price", "sqft_living"]
+    return pd.read_csv(path, usecols=columns).dropna()
+
+
+def show_market_analysis():
+    st.title("Market Analysis")
+    st.caption("Historical sales from the project's cleaned housing dataset.")
+    try:
+        sales = load_market_data()
+    except (OSError, ValueError):
+        st.error("The cleaned housing dataset could not be loaded.")
+        return
+
+    cities = st.multiselect("Filter by city", sorted(sales["city"].unique()))
+    visible = sales[sales["city"].isin(cities)] if cities else sales
+    count, median = st.columns(2)
+    count.metric("Sales in view", f"{len(visible):,}")
+    median.metric("Median sale price", f"${visible['price'].median():,.0f}")
+
+    st.subheader("Sale price distribution")
+    distribution = px.histogram(
+        visible, x="price", labels={"price": "Sale price"}, nbins=40
+    )
+    distribution.update_xaxes(tickprefix="$", tickformat="~s")
+    distribution.update_yaxes(title="Sales")
+    distribution.update_traces(marker_color="#36B99C")
+    distribution.update_layout(height=340, margin=dict(t=16, b=36))
+    st.plotly_chart(distribution, config={"displayModeBar": False})
+
+    st.subheader("Living area and sale price")
+    area = px.scatter(
+        visible,
+        x="sqft_living",
+        y="price",
+        hover_name="city",
+        labels={"sqft_living": "Living area (sq ft)", "price": "Sale price"},
+        opacity=0.5,
+    )
+    area.update_yaxes(tickprefix="$", tickformat="~s")
+    area.update_traces(marker_color="#36B99C")
+    area.update_layout(height=375, margin=dict(t=16, b=36))
+    st.plotly_chart(area, config={"displayModeBar": False})
+
+    st.subheader("Median sale price by city")
+    by_city = (
+        visible.groupby("city", as_index=False)
+        .agg(median_price=("price", "median"), sales=("price", "size"))
+        .nlargest(12, "sales")
+        .sort_values("median_price")
+    )
+    city_prices = px.bar(
+        by_city,
+        x="median_price",
+        y="city",
+        orientation="h",
+        hover_data={"sales": True, "median_price": ":$,.0f"},
+        labels={"median_price": "Median sale price", "city": "City", "sales": "Sales"},
+    )
+    city_prices.update_xaxes(tickprefix="$", tickformat="~s")
+    city_prices.update_traces(marker_color="#36B99C")
+    city_prices.update_layout(height=420, margin=dict(t=16, b=36))
+    st.plotly_chart(city_prices, config={"displayModeBar": False})
+    st.caption("Shows up to 12 cities with the most sales in the current selection.")
+
+
+st.sidebar.header("Real Estate AI")
+page = st.sidebar.radio("Go to", ["Price Predictor", "Market Analysis"])
+if page == "Market Analysis":
+    show_market_analysis()
+    st.stop()
+
+
 st.title("🏠 Real Estate Price Predictor")
 st.write("Predict a house price and understand the model's prediction.")
 
@@ -164,7 +243,7 @@ if "result" in st.session_state:
     res = st.session_state["result"]
 
     st.subheader("Prediction")
-    st.success(f"Estimated house price: \\${res['price']:,.0f}")
+    st.metric("Estimated house price", f"${res['price']:,.0f}")
 
     low, high = res["price"] * 0.85, res["price"] * 1.15
     st.caption(f"Typical range: \\${low:,.0f} – \\${high:,.0f} "
@@ -173,9 +252,56 @@ if "result" in st.session_state:
     st.subheader("What drove this estimate?")
     top = res["contributions"].head(8).copy()
     top["feature"] = top["feature"].map(FRIENDLY_NAMES).fillna(top["feature"])
-    st.bar_chart(top.set_index("feature")["contribution"])
-    st.caption("Bars above zero raised the estimate; bars below zero lowered it, "
-               "compared to an average house.")
+    top["direction"] = "No effect"
+    top.loc[top["contribution"] > 0, "direction"] = "Raised estimate"
+    top.loc[top["contribution"] < 0, "direction"] = "Lowered estimate"
+    top["value_label"] = top["contribution"].map("{:+.3f}".format)
+
+    fig = px.bar(
+        top,
+        x="contribution",
+        y="feature",
+        orientation="h",
+        color="direction",
+        text="value_label",
+        color_discrete_map={
+            "Raised estimate": "#36B99C",
+            "Lowered estimate": "#E58A80",
+            "No effect": "#9CA3AF",
+        },
+    )
+    fig.update_traces(
+        textposition="outside",
+        cliponaxis=False,
+        marker_line_width=0,
+        hovertemplate="%{y}<br>%{fullData.name}: %{x:+.3f}<extra></extra>",
+    )
+    fig.update_yaxes(
+        categoryorder="array",
+        categoryarray=top["feature"].iloc[::-1].tolist(),
+        title=None,
+        fixedrange=True,
+        automargin=True,
+    )
+    span = max(top["contribution"].abs().max(), 0.01)
+    fig.update_xaxes(
+        range=[
+            min(0, top["contribution"].min()) - 0.22 * span,
+            max(0, top["contribution"].max()) + 0.22 * span,
+        ],
+        visible=False,
+        fixedrange=True,
+    )
+    fig.add_vline(x=0, line_width=1, line_color="#88919D", layer="below")
+    fig.update_layout(
+        height=330,
+        margin=dict(l=4, r=12, t=8, b=8),
+        bargap=0.42,
+        showlegend=False,
+    )
+    st.plotly_chart(fig, config={"displayModeBar": False})
+    st.caption("Positive values raised the estimate. Negative values lowered it. "
+               "Values are contributions on the model's log-price scale.")
 
     st.subheader("Summary")
     st.write(build_summary(res["contributions"]))
@@ -183,23 +309,49 @@ if "result" in st.session_state:
     if st.button("Explain Prediction with AI"):
         prompt = build_prompt(res["price"], res["contributions"])
         try:
-            with st.spinner("Generating explanation with local AI..."):
-                r = requests.post(
-                    "http://localhost:11434/api/chat",
-                    json={
-                        "model": "llama3.2:3b",
-                        "messages": [{"role": "user", "content": prompt}],
-                        "stream": False,
-                        "options": {"temperature": 0.2, "num_predict": 350},
-                    },
-                    timeout=180,
-                )
-                r.raise_for_status()
-                st.session_state["explanation"] = r.json()["message"]["content"]
-        except requests.RequestException as e:
-            st.error("Could not connect to Ollama. Make sure Ollama is running "
-                     "and llama3.2:3b is installed.")
-            st.caption(str(e))
+            api_key = os.getenv("GROQ_API_KEY")
+            if not api_key:
+                try:
+                    api_key = st.secrets.get("GROQ_API_KEY")
+                except FileNotFoundError:
+                    api_key = None
+
+            messages = [{"role": "user", "content": prompt}]
+            with st.spinner("Generating explanation..."):
+                if api_key:
+                    response = requests.post(
+                        "https://api.groq.com/openai/v1/chat/completions",
+                        headers={"Authorization": f"Bearer {api_key}"},
+                        json={
+                            "model": "openai/gpt-oss-20b",
+                            "messages": messages,
+                            "reasoning_effort": "low",
+                            "max_completion_tokens": 800,
+                        },
+                        timeout=30,
+                    )
+                    response.raise_for_status()
+                    explanation = response.json()["choices"][0]["message"]["content"]
+                else:
+                    response = requests.post(
+                        "http://localhost:11434/api/chat",
+                        json={
+                            "model": "llama3.2:3b",
+                            "messages": messages,
+                            "stream": False,
+                            "options": {"temperature": 0.2, "num_predict": 350},
+                        },
+                        timeout=30,
+                    )
+                    response.raise_for_status()
+                    explanation = response.json()["message"]["content"]
+
+                if not isinstance(explanation, str) or not explanation.strip():
+                    raise ValueError("Empty explanation")
+                st.session_state["explanation"] = explanation.strip()
+        except (requests.RequestException, KeyError, IndexError, ValueError, TypeError):
+            st.error("AI explanation is temporarily unavailable. "
+                     "Check the Groq key or local Ollama and try again.")
 
     if "explanation" in st.session_state:
         st.subheader("AI Explanation")
