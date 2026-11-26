@@ -12,13 +12,19 @@ st.set_page_config(page_title="Real Estate AI", page_icon="🏠")
 @st.cache_data
 def load_market_data():
     path = Path(__file__).resolve().parent / "data" / "real_estate_cleaned.csv"
-    columns = ["city", "price", "sqft_living"]
-    return pd.read_csv(path, usecols=columns).dropna()
+    columns = [
+        "city", "price", "sqft_living", "sqft_lot", "sqft_above", "sqft_basement",
+        "bedrooms", "bathrooms", "floors", "view", "condition", "waterfront",
+        "has_basement", "was_renovated", "house_age", "date", "price_per_sqft",
+    ]
+    sales = pd.read_csv(path, usecols=columns).dropna(subset=["city", "price", "sqft_living"])
+    sales["date"] = pd.to_datetime(sales["date"], errors="coerce")
+    return sales
 
 
 def show_market_analysis():
     st.title("Market Analysis")
-    st.caption("Historical sales from the project's cleaned housing dataset.")
+    st.caption("Explore the historical sales used in the EDA.")
     try:
         sales = load_market_data()
     except (OSError, ValueError):
@@ -27,54 +33,147 @@ def show_market_analysis():
 
     cities = st.multiselect("Filter by city", sorted(sales["city"].unique()))
     visible = sales[sales["city"].isin(cities)] if cities else sales
-    count, median = st.columns(2)
-    count.metric("Sales in view", f"{len(visible):,}")
-    median.metric("Median sale price", f"${visible['price'].median():,.0f}")
+    if visible.empty:
+        st.info("No sales in this selection.")
+        return
 
-    st.subheader("Sale price distribution")
-    distribution = px.histogram(
-        visible, x="price", labels={"price": "Sale price"}, nbins=40
-    )
-    distribution.update_xaxes(tickprefix="$", tickformat="~s")
-    distribution.update_yaxes(title="Sales")
-    distribution.update_traces(marker_color="#36B99C")
-    distribution.update_layout(height=340, margin=dict(t=16, b=36))
-    st.plotly_chart(distribution, config={"displayModeBar": False})
+    def chart(figure):
+        figure.update_layout(margin=dict(t=24, b=24))
+        st.plotly_chart(figure)
 
-    st.subheader("Living area and sale price")
-    area = px.scatter(
-        visible,
-        x="sqft_living",
-        y="price",
-        hover_name="city",
-        labels={"sqft_living": "Living area (sq ft)", "price": "Sale price"},
-        opacity=0.5,
-    )
-    area.update_yaxes(tickprefix="$", tickformat="~s")
-    area.update_traces(marker_color="#36B99C")
-    area.update_layout(height=375, margin=dict(t=16, b=36))
-    st.plotly_chart(area, config={"displayModeBar": False})
+    overview, prices, features, location, segments, time = st.tabs([
+        "1. Overview", "2. Prices", "3. Features", "4. Location",
+        "5. Segments", "6. Time",
+    ])
+    price = visible["price"]
+    median = price.median()
+    mean = price.mean()
+    dates = visible["date"].dropna()
+    with overview:
+        st.subheader("What does a typical sale look like?")
+        a, b, c = st.columns(3)
+        a.metric("Sales in view", f"{len(visible):,}")
+        b.metric("Median sale price", f"${median:,.0f}")
+        c.metric("Median living area", f"{visible.sqft_living.median():,.0f} sq ft")
+        st.write(f"{visible.city.nunique()} cities. Sales recorded from "
+                 f"{dates.min():%b %d, %Y} to {dates.max():%b %d, %Y}." if len(dates)
+                 else "No recorded sale dates in this selection.")
+        beds = visible["bedrooms"].mode().iloc[0]
+        baths = visible["bathrooms"].mode().iloc[0]
+        st.write(f"The most common counts are {beds:g} bedrooms and {baths:g} bathrooms.")
 
-    st.subheader("Median sale price by city")
-    by_city = (
-        visible.groupby("city", as_index=False)
-        .agg(median_price=("price", "median"), sales=("price", "size"))
-        .nlargest(12, "sales")
-        .sort_values("median_price")
-    )
-    city_prices = px.bar(
-        by_city,
-        x="median_price",
-        y="city",
-        orientation="h",
-        hover_data={"sales": True, "median_price": ":$,.0f"},
-        labels={"median_price": "Median sale price", "city": "City", "sales": "Sales"},
-    )
-    city_prices.update_xaxes(tickprefix="$", tickformat="~s")
-    city_prices.update_traces(marker_color="#36B99C")
-    city_prices.update_layout(height=420, margin=dict(t=16, b=36))
-    st.plotly_chart(city_prices, config={"displayModeBar": False})
-    st.caption("Shows up to 12 cities with the most sales in the current selection.")
+    with prices:
+        st.subheader("How spread out are sale prices?")
+        use_log = st.toggle("Show log-transformed prices")
+        values = np.log1p(price) if use_log else price
+        title = "log(1 + sale price)" if use_log else "Sale price ($)"
+        fig = px.histogram(x=values, nbins=30, labels={"x": title})
+        markers = [("Mean", mean, "#E58A80"), ("Median", median, "#36B99C")]
+        for label, amount, color in markers:
+            position = np.log1p(amount) if use_log else amount
+            fig.add_vline(x=position, line_color=color, line_dash="dash",
+                          annotation_text=f"{label} ${amount:,.0f}",
+                          annotation_position="top left" if label == "Mean" else "top right")
+        chart(fig)
+        q1, q3 = price.quantile([0.25, 0.75])
+        iqr = q3 - q1
+        outliers = ((price < q1 - 1.5 * iqr) | (price > q3 + 1.5 * iqr)).sum()
+        st.write(f"The mean is ${mean:,.0f} and the median is ${median:,.0f}. "
+                 f"{outliers:,} sales fall outside the 1.5× IQR fences.")
+        if use_log:
+            st.caption("The reference lines show the raw-dollar mean and median at their transformed positions.")
+
+    with features:
+        st.subheader("Which property features move with price?")
+        chart(px.scatter(visible, x="sqft_living", y="price", hover_name="city",
+                         opacity=0.45, labels={"sqft_living": "Living area (sq ft)", "price": "Sale price ($)"}))
+        feature_names = {
+            "sqft_living": "Living area", "sqft_lot": "Lot size",
+            "sqft_above": "Above-ground area", "sqft_basement": "Basement area",
+            "bedrooms": "Bedrooms", "bathrooms": "Bathrooms", "floors": "Floors",
+            "view": "View", "condition": "Condition", "waterfront": "Waterfront",
+            "has_basement": "Basement", "was_renovated": "Renovated", "house_age": "House age",
+        }
+        correlations = visible[list(feature_names)].corrwith(price).dropna()
+        if not correlations.empty:
+            strongest = correlations.abs().idxmax()
+            ranked = correlations.rename(index=feature_names).sort_values()
+            chart(px.bar(x=ranked.values, y=ranked.index, orientation="h",
+                         labels={"x": "Pearson correlation with sale price", "y": "Feature"}))
+            st.write(f"{feature_names[strongest]} has the strongest linear association "
+                     f"in this selection (r = {correlations[strongest]:+.2f}).")
+        else:
+            st.caption("Correlations require variation in price and property features.")
+        options = ["bathrooms", "view", "waterfront", "has_basement"]
+        feature = st.selectbox("Compare median price by", options, format_func=feature_names.get)
+        groups = visible.groupby(feature)["price"].agg(median="median", sales="size").reset_index()
+        groups["Group"] = (
+            groups[feature].map({0: "No", 1: "Yes"})
+            if feature in {"waterfront", "has_basement"} else groups[feature].astype(str)
+        )
+        chart(px.bar(groups, x="Group", y="median", hover_data=["sales"],
+                     labels={"median": "Median sale price ($)"}))
+        highest = groups.loc[groups["median"].idxmax()]
+        st.caption(f"Highest group median in this view: {highest['Group']} at "
+                   f"${highest['median']:,.0f} ({highest['sales']:,} sales). Group comparisons are descriptive.")
+
+    with location:
+        st.subheader("How do cities compare?")
+        metrics = {"Median sale price": "price", "Median price per sq ft": "price_per_sqft"}
+        label = st.radio("City ranking metric", list(metrics), horizontal=True)
+        source = metrics[label]
+        by_city = visible.groupby("city")[source].agg(median="median", sales="count").reset_index()
+        qualified = by_city[by_city["sales"] >= 10].sort_values("median", ascending=False)
+        if qualified.empty:
+            st.info("No cities in this selection have 10 sales for the ranking.")
+        else:
+            ranking = st.radio("Show cities", ["Highest 10", "Lowest 10"], horizontal=True)
+            shown = qualified.head(10) if ranking == "Highest 10" else qualified.tail(10)
+            chart(px.bar(shown.sort_values("median"), x="median", y="city", orientation="h",
+                         hover_data=["sales"], labels={"median": label + " ($)", "city": "City"}))
+            leader = qualified.iloc[0] if ranking == "Highest 10" else qualified.iloc[-1]
+            st.write(f"{leader['city']} ranks first in this view at ${leader['median']:,.0f} "
+                     f"({leader['sales']:,} sales). Rankings include cities with at least 10 sales.")
+
+    with segments:
+        st.subheader("How do homes differ across price tiers?")
+        low, high = sales["price"].quantile([0.25, 0.75])
+        tiers = ["Low-cost", "Mid-market", "Premium"]
+        segment = np.select([price <= low, price <= high], tiers[:2], default=tiers[2])
+        summary = visible.assign(segment=segment).groupby("segment").agg(
+            sales=("price", "size"), living_area=("sqft_living", "median"),
+            bathrooms=("bathrooms", "median"), price_per_sqft=("price_per_sqft", "median"),
+        ).reindex(tiers).dropna(how="all")
+        st.write(f"Full-dataset cutoffs are ${low:,.0f} and ${high:,.0f}. "
+                 "These cutoffs stay fixed when you filter by city.")
+        st.dataframe(summary.rename(columns={
+            "sales": "Sales", "living_area": "Median living area (sq ft)",
+            "bathrooms": "Median bathrooms", "price_per_sqft": "Median price per sq ft ($)",
+        }).round(1))
+        largest = summary["living_area"].idxmax()
+        st.caption(f"{largest} has the largest median living area among the displayed tiers "
+                   f"({summary.loc[largest, 'living_area']:,.0f} sq ft).")
+
+    with time:
+        st.subheader("How did activity change over the recorded months?")
+        dated = visible.dropna(subset=["date"])
+        if dated.empty:
+            st.info("No recorded sale dates in this selection.")
+        else:
+            monthly = dated.groupby(dated["date"].dt.to_period("M"))["price"].agg(
+                sales="size", median="median").reset_index()
+            monthly["month"] = monthly["date"].astype(str)
+            for column, label in [("sales", "Sales"), ("median", "Median sale price ($)")]:
+                chart(px.line(monthly, x="month", y=column, markers=True,
+                              labels={"month": "Month", column: label}))
+            busiest = monthly.loc[monthly["sales"].idxmax()]
+            st.caption(f"{busiest['month']} had the most recorded sales in this selection "
+                       f"({busiest['sales']:,}). First and last months may be partial.")
+
+    st.subheader("From EDA to prediction")
+    st.write("The EDA compares past sales across size, features, and location. The Ridge "
+             "model uses property inputs such as living area and ZIP code to predict on "
+             "a log-price scale. Open Price Predictor to see an estimate and its feature breakdown.")
 
 
 st.sidebar.header("Real Estate AI")
